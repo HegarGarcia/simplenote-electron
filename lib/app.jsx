@@ -4,6 +4,7 @@ import { bindActionCreators } from 'redux';
 import { connect } from 'react-redux';
 import 'focus-visible/dist/focus-visible.js';
 import appState from './flux/app-state';
+import { loadTags } from './state/domain/tags';
 import reduxActions from './state/actions';
 import selectors from './state/selectors';
 import browserShell from './browser-shell';
@@ -13,13 +14,13 @@ import AppLayout from './app-layout';
 import Auth from './auth';
 import DevBadge from './components/dev-badge';
 import DialogRenderer from './dialog-renderer';
+import { getIpcRenderer } from './utils/electron';
 import exportZipArchive from './utils/export';
 import { activityHooks, nudgeUnsynced } from './utils/sync';
 import analytics from './analytics';
 import classNames from 'classnames';
 import {
   debounce,
-  noop,
   get,
   has,
   isObject,
@@ -33,20 +34,7 @@ import * as settingsActions from './state/settings/actions';
 
 import filterNotes from './utils/filter-notes';
 
-// Electron-specific mocks
-let ipc = getIpc();
-
-function getIpc() {
-  try {
-    return __non_webpack_require__('electron').ipcRenderer; // eslint-disable-line no-undef
-  } catch (e) {
-    return {
-      on: noop,
-      removeListener: noop,
-      send: noop,
-    };
-  }
-}
+const ipc = getIpcRenderer();
 
 const mapStateToProps = state => ({
   ...state,
@@ -54,7 +42,7 @@ const mapStateToProps = state => ({
   isAuthorized: selectors.auth.isAuthorized(state),
 });
 
-function mapDispatchToProps(dispatch, { noteBucket, tagBucket }) {
+function mapDispatchToProps(dispatch, { noteBucket }) {
   const actionCreators = Object.assign({}, appState.actionCreators);
 
   const thenReloadNotes = action => a => {
@@ -64,7 +52,7 @@ function mapDispatchToProps(dispatch, { noteBucket, tagBucket }) {
 
   const thenReloadTags = action => a => {
     dispatch(action(a));
-    dispatch(actionCreators.loadTags({ tagBucket }));
+    dispatch(loadTags());
   };
 
   return {
@@ -84,6 +72,7 @@ function mapDispatchToProps(dispatch, { noteBucket, tagBucket }) {
       ]),
       dispatch
     ),
+    loadTags: () => dispatch(loadTags()),
     setSortType: thenReloadNotes(settingsActions.setSortType),
     toggleSortOrder: thenReloadNotes(settingsActions.toggleSortOrder),
     toggleSortTagsAlpha: thenReloadTags(settingsActions.toggleSortTagsAlpha),
@@ -118,6 +107,7 @@ export const App = connect(mapStateToProps, mapDispatchToProps)(
       client: PropTypes.object.isRequired,
       isDevConfig: PropTypes.bool.isRequired,
       isSmallScreen: PropTypes.bool.isRequired,
+      loadTags: PropTypes.func.isRequired,
       noteBucket: PropTypes.object.isRequired,
       preferencesBucket: PropTypes.object.isRequired,
       tagBucket: PropTypes.object.isRequired,
@@ -158,9 +148,9 @@ export const App = connect(mapStateToProps, mapDispatchToProps)(
       this.props.preferencesBucket.on('update', this.onLoadPreferences);
 
       this.props.tagBucket
-        .on('index', this.onTagsIndex)
-        .on('update', debounce(this.onTagsIndex, 200))
-        .on('remove', this.onTagsIndex);
+        .on('index', this.props.loadTags)
+        .on('update', debounce(this.props.loadTags, 200))
+        .on('remove', this.props.loadTags);
 
       this.props.client
         .on('authorized', this.onAuthChanged)
@@ -278,7 +268,7 @@ export const App = connect(mapStateToProps, mapDispatchToProps)(
 
       // 'Kick' the app to ensure content is loaded after signing in
       this.onNotesIndex();
-      this.onTagsIndex();
+      this.props.loadTags();
     };
 
     onNotesIndex = () =>
@@ -300,9 +290,6 @@ export const App = connect(mapStateToProps, mapDispatchToProps)(
         preferencesBucket: this.props.preferencesBucket,
       });
 
-    onTagsIndex = () =>
-      this.props.actions.loadTags({ tagBucket: this.props.tagBucket });
-
     initializeElectron = () => {
       const remote = __non_webpack_require__('electron').remote; // eslint-disable-line no-undef
 
@@ -319,14 +306,6 @@ export const App = connect(mapStateToProps, mapDispatchToProps)(
         noteBucket: this.props.noteBucket,
         note,
         content,
-      });
-
-    onUpdateNoteTags = (note, tags) =>
-      this.props.actions.updateNoteTags({
-        noteBucket: this.props.noteBucket,
-        tagBucket: this.props.tagBucket,
-        note,
-        tags,
       });
 
     // gets the index of the note located before the currently selected one
@@ -414,7 +393,6 @@ export const App = connect(mapStateToProps, mapDispatchToProps)(
                 onNoteClosed={() => this.setState({ isNoteOpen: false })}
                 onNoteOpened={() => this.setState({ isNoteOpen: true })}
                 onUpdateContent={this.onUpdateContent}
-                onUpdateNoteTags={this.onUpdateNoteTags}
               />
               {state.showNoteInfo && <NoteInfo noteBucket={noteBucket} />}
             </div>

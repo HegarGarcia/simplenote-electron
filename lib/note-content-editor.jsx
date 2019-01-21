@@ -1,21 +1,25 @@
 import React, { Component } from 'react';
 import PropTypes from 'prop-types';
 import { ContentState, Editor, EditorState, Modifier } from 'draft-js';
-import { get, includes, invoke, noop } from 'lodash';
+import MultiDecorator from 'draft-js-multidecorators';
+import { compact, get, includes, invoke, noop } from 'lodash';
 
+import {
+  getCurrentBlock,
+  getSelectedText,
+  plainTextContent,
+} from './editor/utils';
 import { filterHasText, searchPattern } from './utils/filter-notes';
 import matchingTextDecorator from './editor/matching-text-decorator';
+import checkboxDecorator from './editor/checkbox-decorator';
+import { removeCheckbox, shouldRemoveCheckbox } from './editor/checkbox-utils';
+import { taskRegex } from './note-detail/toggle-task/constants';
+import insertOrRemoveCheckboxes from './editor/insert-or-remove-checkboxes';
+import { getIpcRenderer } from './utils/electron';
+import analytics from './analytics';
 
-function plainTextContent(editorState) {
-  return editorState.getCurrentContent().getPlainText('\n');
-}
-
-function getCurrentBlock(editorState) {
-  const key = editorState.getSelection().getFocusKey();
-  return editorState.getCurrentContent().getBlockForKey(key);
-}
-
-const isLonelyBullet = line => includes(['-', '*', '+'], line.trim());
+const isLonelyBullet = line =>
+  includes(['-', '*', '+', '- [ ]', '- [x]'], line.trim());
 
 function indentCurrentBlock(editorState) {
   const selection = editorState.getSelection();
@@ -110,7 +114,7 @@ function finishList(editorState) {
   );
 }
 
-function continueList(editorState, listItemMatch) {
+function continueList(editorState, itemPrefix) {
   // create a new line
   const withNewLine = EditorState.push(
     editorState,
@@ -127,7 +131,7 @@ function continueList(editorState, listItemMatch) {
     Modifier.insertText(
       withNewLine.getCurrentContent(),
       withNewLine.getCurrentContent().getSelectionAfter(),
-      listItemMatch[0]
+      itemPrefix
     ),
     'insert-characters'
   );
@@ -154,11 +158,36 @@ export default class NoteContentEditor extends Component {
     storeHasFocus: noop,
   };
 
+  ipc = getIpcRenderer();
+
+  replaceRangeWithText = (rangeToReplace, newText) => {
+    const { editorState } = this.state;
+    const newContentState = Modifier.replaceText(
+      editorState.getCurrentContent(),
+      rangeToReplace,
+      newText
+    );
+    this.handleEditorStateChange(
+      EditorState.push(editorState, newContentState, 'replace-text')
+    );
+  };
+
+  createNewEditorState = (text, filter) => {
+    return EditorState.createWithContent(
+      ContentState.createFromText(text, '\n'),
+      new MultiDecorator(
+        compact([
+          filterHasText(filter) && matchingTextDecorator(searchPattern(filter)),
+          checkboxDecorator(this.replaceRangeWithText),
+        ])
+      )
+    );
+  };
+
   state = {
-    editorState: EditorState.createWithContent(
-      ContentState.createFromText(this.props.content, '\n'),
-      filterHasText(this.props.filter) &&
-        matchingTextDecorator(searchPattern(this.props.filter))
+    editorState: this.createNewEditorState(
+      this.props.content,
+      this.props.filter
     ),
   };
 
@@ -167,7 +196,37 @@ export default class NoteContentEditor extends Component {
   componentDidMount() {
     this.props.storeFocusEditor(this.focus);
     this.props.storeHasFocus(this.hasFocus);
+    this.ipc.on('appCommand', this.onAppCommand);
   }
+
+  handleEditorStateChange = editorState => {
+    const { editorState: prevEditorState } = this.state;
+
+    if (editorState === prevEditorState) {
+      return;
+    }
+
+    let newEditorState = editorState;
+
+    if (shouldRemoveCheckbox(editorState, prevEditorState)) {
+      const newContentState = removeCheckbox(editorState, prevEditorState);
+      newEditorState = EditorState.push(
+        editorState,
+        newContentState,
+        'remove-range'
+      );
+    }
+
+    const nextContent = plainTextContent(newEditorState);
+    const prevContent = plainTextContent(prevEditorState);
+
+    const announceChanges =
+      nextContent !== prevContent
+        ? () => this.props.onChangeContent(nextContent)
+        : noop;
+
+    this.setState({ editorState: newEditorState }, announceChanges);
+  };
 
   componentDidUpdate(prevProps) {
     // To immediately reflect the changes to the spell check setting,
@@ -184,22 +243,6 @@ export default class NoteContentEditor extends Component {
     this.editor = ref;
   };
 
-  handleEditorStateChange = editorState => {
-    if (editorState === this.state.editorState) {
-      return;
-    }
-
-    const nextContent = plainTextContent(editorState);
-    const prevContent = plainTextContent(this.state.editorState);
-
-    const announceChanges =
-      nextContent !== prevContent
-        ? () => this.props.onChangeContent(nextContent)
-        : noop;
-
-    this.setState({ editorState }, announceChanges);
-  };
-
   componentWillReceiveProps({ content: newContent, filter: nextFilter }) {
     const { filter: prevFilter } = this.props;
     const { editorState: oldEditorState } = this.state;
@@ -211,11 +254,7 @@ export default class NoteContentEditor extends Component {
       return; // identical to rendered content
     }
 
-    let newEditorState = EditorState.createWithContent(
-      ContentState.createFromText(newContent, '\n'),
-      filterHasText(nextFilter) &&
-        matchingTextDecorator(searchPattern(nextFilter))
-    );
+    let newEditorState = this.createNewEditorState(newContent, nextFilter);
 
     // avoids weird caret position if content is changed
     // while the editor had focus, see
@@ -225,6 +264,10 @@ export default class NoteContentEditor extends Component {
     }
 
     this.setState({ editorState: newEditorState });
+  }
+
+  componentWillUnmount() {
+    this.ipc.removeListener('appCommand', this.onAppCommand);
   }
 
   focus = () => {
@@ -270,32 +313,74 @@ export default class NoteContentEditor extends Component {
     const { editorState } = this.state;
     const line = getCurrentBlock(editorState).getText();
 
+    const firstCharIndex = line.search(/\S/);
+    const caretIsCollapsedAt = index => {
+      const { anchorOffset, focusOffset } = editorState.getSelection();
+      return anchorOffset === index && focusOffset === index;
+    };
+    const atBeginningOfLine =
+      caretIsCollapsedAt(0) || caretIsCollapsedAt(firstCharIndex);
+
+    if (atBeginningOfLine) {
+      return 'not-handled';
+    }
+
     if (isLonelyBullet(line)) {
       this.handleEditorStateChange(finishList(editorState));
       return 'handled';
     }
 
     const listItemMatch = line.match(listItemRe);
-    if (listItemMatch) {
-      this.handleEditorStateChange(continueList(editorState, listItemMatch));
+    const taskItemMatch = line.match(taskRegex);
+
+    if (taskItemMatch) {
+      const nextTaskPrefix = line.replace(taskRegex, '$1- [ ] ');
+      this.handleEditorStateChange(continueList(editorState, nextTaskPrefix));
+      return 'handled';
+    } else if (listItemMatch) {
+      this.handleEditorStateChange(continueList(editorState, listItemMatch[0]));
       return 'handled';
     }
 
     return 'not-handled';
   };
 
+  onAppCommand = (event, command) => {
+    if (get(command, 'action') === 'insertChecklist') {
+      this.handleEditorStateChange(
+        insertOrRemoveCheckboxes(this.state.editorState)
+      );
+      analytics.tracks.recordEvent('editor_checklist_inserted');
+    }
+  };
+
+  /**
+   * Copy the raw text as determined by the DraftJS SelectionState.
+   *
+   * By not relying on the browser's interpretation of the contenteditable
+   * selection, this allows for the clipboard data to more accurately reflect
+   * the internal plain text data.
+   */
+  copyPlainText = event => {
+    const textToCopy = getSelectedText(this.state.editorState);
+    event.clipboardData.setData('text/plain', textToCopy);
+    event.preventDefault();
+  };
+
   render() {
     return (
-      <Editor
-        key={this.editorKey}
-        ref={this.saveEditorRef}
-        spellCheck={this.props.spellCheckEnabled}
-        stripPastedStyles
-        onChange={this.handleEditorStateChange}
-        editorState={this.state.editorState}
-        onTab={this.onTab}
-        handleReturn={this.handleReturn}
-      />
+      <div onCopy={this.copyPlainText} onCut={this.copyPlainText}>
+        <Editor
+          key={this.editorKey}
+          ref={this.saveEditorRef}
+          spellCheck={this.props.spellCheckEnabled}
+          stripPastedStyles
+          onChange={this.handleEditorStateChange}
+          editorState={this.state.editorState}
+          onTab={this.onTab}
+          handleReturn={this.handleReturn}
+        />
+      </div>
     );
   }
 }
